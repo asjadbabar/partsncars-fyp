@@ -1,20 +1,23 @@
-// server/db.js
+// MySQL connection pool. Plain db.query(...) calls work as before, and
+// db.promise().getConnection() gives a dedicated connection for transactions.
 const mysql = require('mysql2');
 
-const conn = mysql.createConnection({
+const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'partsncars'
+  database: process.env.DB_NAME || 'partsncars',
+  waitForConnections: true,
+  connectionLimit: 10,
 });
 
-// Connect to the database
-conn.connect((err) => {
+pool.getConnection((err, conn) => {
   if (err) {
     console.error('MySQL connection error:', err);
     return;
   }
   console.log('Connected to MySQL database ✅');
+  conn.release();
 });
 
-module.exports = conn;
+module.exports = pool;

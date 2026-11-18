@@ -51,122 +51,33 @@ app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   // Handle successful payment
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
-
-    const userId = session.metadata.user_id;
-    const name = session.metadata.name;
-    const email = session.metadata.email;
-    const address = session.metadata.address;
-    const phone = session.metadata.phone;
+    const { user_id: userId, name, email, address, phone } = session.metadata;
     const total = session.amount_total / 100; // Stripe uses cents
-    const cartItems = JSON.parse(session.metadata.cartItems); // stored as stringified JSON
+    const cartItems = JSON.parse(session.metadata.cartItems); // [{ product_id, quantity }]
 
-    // Insert order
-    const orderQuery = `
-      INSERT INTO orders (user_id, name, email, address,phone, payment_method, total_price)
-      VALUES (?, ?, ?, ?, ?, ?,?)
-    `;
-
-    db.query(
-      orderQuery,
-      [userId, name, email, address, phone, "online", total],
-      (err, orderResult) => {
-        if (err) {
-          console.error("Insert order error:", err);
-          return res.status(500).end();
-        }
-
-        const orderId = orderResult.insertId;
-
-        // Insert order items
-        const itemsData = cartItems.map((item) => [
-          orderId,
-          item.product_id,
-          item.title,
-          item.price,
-          item.quantity,
-        ]);
-
-        const orderItemsQuery = `
-        INSERT INTO order_items (order_id, product_id, title, price, quantity)
-        VALUES ?
-      `;
-
-        db.query(orderItemsQuery, [itemsData], (err) => {
-          if (err) {
-            console.error("Insert order items error:", err);
-            return res.status(500).end();
-          }
-
-          // Insert payment record
-          const paymentQuery = `
-          INSERT INTO payments (user_id, order_id, amount, payment_method, payment_status)
-          VALUES (?, ?, ?, ?, ?)
-        `;
-
-          db.query(
-            paymentQuery,
-            [userId, orderId, total, "Stripe", "completed"],
-            (err) => {
-              if (err) {
-                console.error("Insert payment error:", err);
-                return res.status(500).end();
-              }
-
-              // Update product quantities
-              let updateCount = 0;
-              let failedUpdate = false;
-
-              cartItems.forEach((item) => {
-                const updateProductQuery = `
-              UPDATE products
-              SET quantity = quantity - ?
-              WHERE id = ? AND quantity >= ?
-            `;
-
-                db.query(
-                  updateProductQuery,
-                  [item.quantity, item.product_id, item.quantity],
-                  (err) => {
-                    if (err) {
-                      console.error(
-                        `❌ Error updating product ${item.product_id}:`,
-                        err
-                      );
-                      failedUpdate = true;
-                    }
-
-                    updateCount++;
-
-                    // Once all updates are done
-                    if (updateCount === cartItems.length) {
-                      if (failedUpdate) {
-                        return res.status(500).end(); // Optional: rollback other changes
-                      }
-
-                      // Clear user's cart
-                      const clearCartQuery = `DELETE FROM carts WHERE user_id = ?`;
-                      db.query(clearCartQuery, [userId], (err) => {
-                        if (err) {
-                          console.error("Clear cart error:", err);
-                          return res.status(500).end();
-                        }
-                        const io = req.app.get("io");
-                        io.emit("update-summary");
-                        io.emit("product_added");
-                        console.log(
-                          "✅ Order, payment saved, product stock updated, and cart cleared."
-                        );
-                        res.status(200).json({ received: true });
-                      });
-                    }
-                  }
-                );
-              });
-            }
-          );
-        });
-      }
-    );
+    placeOrder({
+      userId,
+      name,
+      email,
+      address,
+      phone,
+      paymentMethod: "online",
+      paymentLabel: "Stripe",
+      paymentStatus: "completed",
+      items: cartItems.map((i) => ({ id: i.product_id, quantity: i.quantity })),
+      paidTotal: total,
+    })
+      .then(() => {
+        const io = req.app.get("io");
+        io.emit("update-summary");
+        io.emit("product_added");
+        console.log("✅ Stripe order saved in one transaction.");
+        res.status(200).json({ received: true });
+      })
+      .catch((err) => {
+        console.error("Stripe order error:", err.message);
+        res.status(err.status || 500).end();
+      });
   } else {
     res.status(200).json({ received: true });
   }
@@ -217,7 +128,7 @@ if (!passwordRegex.test(password)) {
   }
 
   try {
-    const hashedPassword = await bcrypt.hash(password, 5);
+    const hashedPassword = await bcrypt.hash(password, 10);
     const sql =
       "INSERT INTO users (name, email, password, phone) VALUES (?, ?, ?, ?)";
     const values = [name, email, hashedPassword, phone];
@@ -291,6 +202,117 @@ function verifyRoot(req, res, next) {
     return res.status(403).json({ error: "Access denied. Root only." });
   }
   next();
+}
+
+// Loads each cart item's real price, title and stock from the database, so
+// totals never depend on prices sent by the browser.
+async function getPricedItems(conn, items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    const e = new Error("Cart is empty");
+    e.status = 400;
+    throw e;
+  }
+  const priced = [];
+  for (const item of items) {
+    const quantity = Number(item.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      const e = new Error("Invalid quantity");
+      e.status = 400;
+      throw e;
+    }
+    const [rows] = await conn.query(
+      "SELECT id, title, price, quantity FROM products WHERE id = ?",
+      [item.id]
+    );
+    if (rows.length === 0) {
+      const e = new Error(`Product ${item.id} not found`);
+      e.status = 404;
+      throw e;
+    }
+    const product = rows[0];
+    if (product.quantity < quantity) {
+      const e = new Error(`Not enough stock for ${product.title}`);
+      e.status = 409;
+      throw e;
+    }
+    priced.push({
+      id: product.id,
+      title: product.title,
+      price: Number(product.price),
+      quantity,
+    });
+  }
+  return priced;
+}
+
+// Writes the order, its items and payment, decrements stock and clears the
+// cart in ONE transaction. Rows are locked with FOR UPDATE, and the stock
+// update only succeeds while enough stock remains, so concurrent orders can
+// never push stock below zero. Any failure rolls everything back.
+async function placeOrder({
+  userId,
+  name,
+  email,
+  address,
+  phone,
+  paymentMethod,
+  paymentLabel,
+  paymentStatus,
+  items,
+  paidTotal,
+}) {
+  const conn = await db.promise().getConnection();
+  try {
+    await conn.beginTransaction();
+
+    for (const item of items) {
+      await conn.query("SELECT id FROM products WHERE id = ? FOR UPDATE", [
+        item.id,
+      ]);
+    }
+    const priced = await getPricedItems(conn, items);
+    const total =
+      paidTotal !== undefined
+        ? paidTotal
+        : priced.reduce((sum, i) => sum + i.price * i.quantity, 0);
+
+    const [orderResult] = await conn.query(
+      "INSERT INTO orders (user_id, name, email, address, phone, payment_method, total_price) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [userId, name, email, address, phone, paymentMethod, total]
+    );
+    const orderId = orderResult.insertId;
+
+    await conn.query(
+      "INSERT INTO order_items (order_id, product_id, title, price, quantity) VALUES ?",
+      [priced.map((i) => [orderId, i.id, i.title, i.price, i.quantity])]
+    );
+
+    await conn.query(
+      "INSERT INTO payments (user_id, order_id, amount, payment_method, payment_status) VALUES (?, ?, ?, ?, ?)",
+      [userId, orderId, total, paymentLabel, paymentStatus]
+    );
+
+    for (const i of priced) {
+      const [result] = await conn.query(
+        "UPDATE products SET quantity = quantity - ? WHERE id = ? AND quantity >= ?",
+        [i.quantity, i.id, i.quantity]
+      );
+      if (result.affectedRows === 0) {
+        const e = new Error(`Not enough stock for ${i.title}`);
+        e.status = 409;
+        throw e;
+      }
+    }
+
+    await conn.query("DELETE FROM carts WHERE user_id = ?", [userId]);
+    await conn.commit();
+    return { orderId, total };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }
 
 //get all products to display on listing page
@@ -717,106 +739,32 @@ app.delete("/cart/remove/:productId", authenticateToken, (req, res) => {
 
 //checkout for cod ordere
 
-app.post("/checkout", authenticateToken, (req, res) => {
+app.post("/checkout", authenticateToken, async (req, res) => {
   const { name, email, address, phone, paymentMethod, cartItems } = req.body;
   const userId = req.user.userId;
 
-  const total = cartItems.reduce(
-    (sum, item) => sum + item.price * item.quantity,
-    0
-  );
-
-  // Step 1: Insert into orders table
-  db.query(
-    "INSERT INTO orders (user_id, name, email, address, phone, payment_method, total_price) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [userId, name, email, address, phone, paymentMethod, total],
-    (err, orderResult) => {
-      if (err) {
-        console.error("Error inserting into orders:", err);
-        return res.status(500).json({ error: "Failed to place order." });
-      }
-
-      const orderId = orderResult.insertId;
-
-      // ✅ Step 1.5: Insert into payments table
-      db.query(
-        "INSERT INTO payments (user_id, order_id, amount, payment_method, payment_status) VALUES (?, ?, ?, ?, ?)",
-        [userId, orderId, total, paymentMethod, "pending"],
-        (err) => {
-          if (err) {
-            console.error("Error inserting into payments:", err);
-            return res
-              .status(500)
-              .json({ error: "Order created but payment record failed." });
-          }
-
-          let completed = 0;
-          let hasError = false;
-
-          // Step 2: Insert into order_items
-          cartItems.forEach((item) => {
-            db.query(
-              "INSERT INTO order_items (order_id, product_id, title, price, quantity) VALUES (?, ?, ?, ?, ?)",
-              [orderId, item.id, item.title, item.price, item.quantity],
-              (err) => {
-                if (hasError) return;
-
-                if (err) {
-                  hasError = true;
-                  console.error("Error inserting into order_items:", err);
-                  return res
-                    .status(500)
-                    .json({ error: "Failed to insert order items." });
-                }
-
-                // Step 3: Update product stock
-                db.query(
-                  "UPDATE products SET quantity = quantity - ? WHERE id = ?",
-                  [item.quantity, item.id],
-                  (err) => {
-                    if (hasError) return;
-
-                    if (err) {
-                      hasError = true;
-                      console.error("Error updating product quantity:", err);
-                      return res
-                        .status(500)
-                        .json({ error: "Failed to update product stock." });
-                    }
-
-                    completed++;
-                    if (completed === cartItems.length) {
-                      // Step 4: Clear cart
-                      db.query(
-                        "DELETE FROM carts WHERE user_id = ?",
-                        [userId],
-                        (err) => {
-                          if (err) {
-                            console.error("Error clearing cart:", err);
-                            return res
-                              .status(500)
-                              .json({
-                                error: "Order placed but failed to clear cart.",
-                              });
-                          }
-                          const io = req.app.get("io");
-                          io.emit("update-summary");
-                          io.emit("product_added");
-                          return res.status(200).json({
-                            message: "Order  successfully.",
-                          });
-                        }
-                      );
-                    }
-                  }
-                );
-              }
-            );
-          });
-        }
-      );
-    }
-  );
+  try {
+    await placeOrder({
+      userId,
+      name,
+      email,
+      address,
+      phone,
+      paymentMethod,
+      paymentLabel: paymentMethod,
+      paymentStatus: "pending",
+      items: (cartItems || []).map((i) => ({ id: i.id, quantity: i.quantity })),
+    });
+    const io = req.app.get("io");
+    io.emit("update-summary");
+    io.emit("product_added");
+    return res.status(200).json({ message: "Order placed successfully." });
+  } catch (err) {
+    console.error("Checkout error:", err.message);
+    return res
+      .status(err.status || 500)
+      .json({ error: err.status ? err.message : "Failed to place order." });
+  }
 });
 
 //stripe payment session creation webhook is on top
@@ -828,12 +776,14 @@ app.post(
     try {
       const { items, name, email, address, phone } = req.body;
       const userId = req.user.userId;
-      console.log(items);
       if (!items || !items.length) {
         return res.status(400).json({ error: "Cart is empty" });
       }
 
-      const lineItems = items.map((item) => ({
+      // Prices come from the database, never from the request body
+      const priced = await getPricedItems(db.promise(), items);
+
+      const lineItems = priced.map((item) => ({
         price_data: {
           currency: "usd",
           product_data: { name: item.title },
@@ -841,10 +791,8 @@ app.post(
         },
         quantity: item.quantity,
       }));
-      const minimalCartItems = items.map((item) => ({
-        product_id: item.id, // use 'id' if that's your key
-        price: item.price,
-        title: item.title,
+      const minimalCartItems = priced.map((item) => ({
+        product_id: item.id,
         quantity: item.quantity,
       }));
       const session = await stripe.checkout.sessions.create({
@@ -865,10 +813,12 @@ app.post(
 
       res.json({ id: session.id });
     } catch (err) {
-      console.error("🔥 Stripe session creation error:", err); // Show the actual error in backend console
-      res
-        .status(500)
-        .json({ error: "Failed to create Stripe Checkout session" });
+      console.error("🔥 Stripe session creation error:", err);
+      res.status(err.status || 500).json({
+        error: err.status
+          ? err.message
+          : "Failed to create Stripe Checkout session",
+      });
     }
   }
 );
@@ -1553,7 +1503,7 @@ app.get("/admin/user-sales", authenticateToken, verifyRoot, (req, res) => {
   });
 });
 
-app.get("/admin/users", authenticateToken, (req, res) => {
+app.get("/admin/users", authenticateToken, verifyRoot, (req, res) => {
   const sql = "SELECT id, name, email, phone, role FROM users";
 
   db.query(sql, (err, results) => {
@@ -1566,7 +1516,7 @@ app.get("/admin/users", authenticateToken, (req, res) => {
   });
 });
 
-app.patch("/admin/update-user/:userId", authenticateToken, (req, res) => {
+app.patch("/admin/update-user/:userId", authenticateToken, verifyRoot, (req, res) => {
   const userId = req.params.userId;
   const { email, phone } = req.body;
 
